@@ -2,6 +2,7 @@ import bpy
 import bpy_extras
 import math
 import os
+import gc
 import numpy as np
 from math import pi, acos, degrees, cos, sin
 from mathutils import Vector
@@ -33,45 +34,77 @@ def setup_camera_tracking(camera, target):
 def setup_gpu_rendering(scene):
     """
     配置Blender使用NVIDIA GPU进行渲染 (Cycles)
-    这是真正需要用 GPU 的地方
+    核心优化：OPTIX + 持久化数据 + 光程限制 + 降噪
     """
     scene.render.engine = 'CYCLES'
+    
+    # 1. 启用数据持久化 (关键优化：避免每帧重新加载几何体)
+    # 适合只有相机和物体移动，拓扑结构不变的场景
+    scene.render.use_persistent_data = True
     
     # 获取Cycles偏好设置
     cycles_prefs = bpy.context.preferences.addons['cycles'].preferences
     cycles_prefs.refresh_devices()
     
-    # 尝试启用 CUDA 或 OPTIX
-    device_type = 'CUDA'
-    # 如果显卡支持光追，OPTIX 通常比 CUDA 快
-    # 这里为了稳妥先用 CUDA，你可以手动改为 'OPTIX'
+    # 2. 硬件加速优先尝试 OPTIX (RTX显卡极速加成)，其次 CUDA
+    device_types = ['OPTIX', 'CUDA']
+    found_device = False
     
-    try:
-        cycles_prefs.compute_device_type = device_type
-    except TypeError:
-        # 旧版 Blender 兼容
-        pass
-
-    # 激活所有的 GPU 设备，关闭 CPU
-    has_gpu = False
-    for device in cycles_prefs.devices:
-        if device.type == device_type:
-            device.use = True
-            has_gpu = True
-            print(f"已激活渲染设备: {device.name}")
-        else:
-            device.use = False
+    for device_type in device_types:
+        try:
+            cycles_prefs.compute_device_type = device_type
+            # 检查是否有可用设备
+            available_devices = [d for d in cycles_prefs.devices if d.type == device_type]
+            if available_devices:
+                print(f"正在使用显卡接口: {device_type}")
+                # 激活设备
+                for device in cycles_prefs.devices:
+                    device.use = (device.type == device_type)
+                    if device.use:
+                        print(f"已激活渲染设备: {device.name}")
+                found_device = True
+                break
+        except TypeError:
+            pass
     
-    if not has_gpu:
-        print("警告: 未检测到兼容的 GPU，将使用 CPU 渲染。")
-
-    # 设置场景使用 GPU
-    scene.cycles.device = 'GPU'
+    if not found_device:
+        print("警告: 未检测到兼容的 GPU (OPTIX/CUDA)，将使用 CPU 渲染。")
+        scene.cycles.device = 'CPU'
+    else:
+        # 设置场景使用 GPU
+        scene.cycles.device = 'GPU'
     
-    # 渲染优化参数 (根据需要调整)
+    # 3. 渲染参数优化
     scene.cycles.samples = 64  # 采样率
     scene.cycles.use_adaptive_sampling = True # 自适应采样
+    scene.cycles.adaptive_threshold = 0.05 # 稍微放宽噪点阈值
     
+    # 4. 开启 AI 降噪 (OptiX / OpenImageDenoise)
+    # 允许低采样下快速出图
+    try:
+        # 注意：不同 Blender 版本访问方式可能不同，这里尝试通用方式
+        vl = scene.view_layers[0]
+        vl.cycles.use_denoising = True
+        # 如果是 OPTIX 设备，使用 OPTIX 降噪最快
+        if found_device and cycles_prefs.compute_device_type == 'OPTIX':
+            vl.cycles.denoiser = 'OPTIX'
+        else:
+            vl.cycles.denoiser = 'OPENIMAGEDENOISE'
+    except Exception as e:
+        print(f"开启降噪失败 (非致命): {e}")
+
+    # 5. 光程优化 (Light Paths) - 极大地影响渲染时间
+    # 这种工业/标注场景通常不需要复杂的全局光照反弹
+    scene.cycles.max_bounces = 4        # 限制总弹射次数 (默认12)
+    scene.cycles.diffuse_bounces = 2    # 漫反射
+    scene.cycles.glossy_bounces = 2     # 光泽/反射
+    scene.cycles.transparent_max_bounces = 4 # 透明
+    scene.cycles.transmission_bounces = 4 # 透射
+    
+    # 禁用焦散 (通常不需要，且计算昂贵)
+    scene.cycles.caustics_reflective = False
+    scene.cycles.caustics_refractive = False
+
     if hasattr(scene.view_settings, 'gpu_acceleration'):
         scene.view_settings.gpu_acceleration = 'AUTO'
     
@@ -214,10 +247,10 @@ def set_LEDs(rings_combination, fans_to_save, light_ups, light_bottoms, light_le
         mat_name = f"target_aim_{ring}" if ring != -1 else "target_aim_n1"
         mat_index = fan.data.materials.find(mat_name)
         if mat_index != -1:
-            # 注意：这里直接修改 polygon material_index，Blender 可能不会立即刷新
-            # 对于渲染来说通常没问题，但如果是 Viewport 预览可能需要 update
-            fan.data.polygons[1358].material_index = mat_index
-            fan.data.update()
+            # 优化：先检查是否需要修改，避免不必要的 mesh.update() 触发 BVH 重建
+            if fan.data.polygons[1358].material_index != mat_index:
+                fan.data.polygons[1358].material_index = mat_index
+                fan.data.update()
         
         lu = light_ups[i]
         lb = light_bottoms[i]
@@ -283,12 +316,19 @@ def turn_off_light_left(obj):
     all_mat_indices = np.empty(num_polys, dtype=np.int32)
     mesh.polygons.foreach_get("material_index", all_mat_indices)
     
+    # 优化：保存原始状态副本用于比较
+    original_indices = all_mat_indices.copy()
+    
     # 批量更新
     valid_plastic = material_index_plastic_light_left_list[material_index_plastic_light_left_list < num_polys]
     all_mat_indices[valid_plastic] = mat_plastic
     
     valid_metal = material_index_light_left_list[material_index_light_left_list < num_polys]
     all_mat_indices[valid_metal] = mat_metal
+    
+    # 优化：如果没有变化，跳过更新
+    if np.array_equal(original_indices, all_mat_indices):
+        return
     
     mesh.polygons.foreach_set("material_index", all_mat_indices)
     mesh.update()
@@ -314,6 +354,14 @@ def set_material_indices(obj, indices, mat_name, update=True):
     # 过滤越界索引
     valid_indices = indices[indices < num_polys]
     
+    # 优化：检查是否真的需要更新
+    # 获取目标位置当前的索引
+    current_indices_at_target = all_mat_indices[valid_indices]
+    
+    # 如果所有目标位置的索引已经是 mat_idx，则无需操作
+    if np.all(current_indices_at_target == mat_idx):
+        return
+
     # NumPy 批量赋值
     all_mat_indices[valid_indices] = mat_idx
     
@@ -325,10 +373,18 @@ def reset_to_metal(obj, update=True):
     mat_metal = obj.data.materials.find("metal")
     if mat_metal == -1: return
     
-    # 使用 foreach_set 批量重置
     mesh = obj.data
     num_polys = len(mesh.polygons)
-    all_mat_indices = np.full(num_polys, mat_metal, dtype=np.int32)
+    
+    # 优化：先读取当前状态，检查是否已经是全 metal
+    all_mat_indices = np.empty(num_polys, dtype=np.int32)
+    mesh.polygons.foreach_get("material_index", all_mat_indices)
+    
+    if np.all(all_mat_indices == mat_metal):
+        return
+
+    # 使用 foreach_set 批量重置
+    all_mat_indices.fill(mat_metal)
     mesh.polygons.foreach_set("material_index", all_mat_indices)
     if update:
         mesh.update()
@@ -578,6 +634,9 @@ if __name__ == "__main__":
 
     print("开始渲染循环...")
     
+    # 禁用 Global Undo 以节省内存 (关键优化)
+    bpy.context.preferences.edit.use_global_undo = False
+    
     # 定义每个组合生成的样本数量倍率
     # 原来是 2(dist) * 3(exp) = 6 倍 total_frames
     # 保持这个数量级
@@ -646,11 +705,11 @@ if __name__ == "__main__":
                 labels.append(label)
                 
             dont_save = False
-            for i in range(len(fans_to_save)):
+            for j in range(len(fans_to_save)):
                 # ... 同原逻辑 ...
-                fan = fans_to_save[i]
-                kp = keypoints_to_save[i]
-                ring_val = rings_combination[i]
+                fan = fans_to_save[j]
+                kp = keypoints_to_save[j]
+                ring_val = rings_combination[j]
                 cls_idx = class_index_map.get(ring_val, 0)
                 
                 flag, label = get_obj_label_with_kp(scene, camera, cls_idx, fan, kp)
@@ -669,5 +728,9 @@ if __name__ == "__main__":
             
             # 7. 保存结果 (渲染)
             save_output_files(output_dir, distance, frame, labels, scene, rings_combination, exposure)
+
+            # 内存优化：每5帧手动执行垃圾回收，防止卡顿
+            if i % 5 == 0:
+                gc.collect()
 
     print("All Done!")
